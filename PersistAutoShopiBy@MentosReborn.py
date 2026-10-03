@@ -2,6 +2,7 @@ import requests
 import re
 import json
 import html
+from copy import deepcopy
 import random
 import string
 import urllib.parse
@@ -171,50 +172,32 @@ def fetch_js(session_obj, js_url: str, shop_url: str, referer: str) -> str:
         raise Exception(f"GET JS returned status {resp.status_code}")
     return resp.text
 
-def extract_proposal_id(js_body: str) -> str:
+def extract_operation_id(js_body: str, op_name: str, op_type: str, taken: set) -> str:
+    """Locate a persisted-query id for op_name in minified checkout JS.
+    Handles any field order, both quote styles, and manifest-map form."""
+    H = r'([a-f0-9]{64})'
+    Q = r'["\']'
     patterns = [
-        r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"query"\s*,\s*name:\s*"Proposal"',
-        r'name:\s*"Proposal"\s*,\s*type:\s*"query"\s*,\s*id:\s*"([a-f0-9]{64})"',
-        r'"Proposal"[^}]{0,200}id:\s*"([a-f0-9]{64})"',
-        r'id:\s*"([a-f0-9]{64})"[^}]{0,200}"Proposal"',
-        r'id:\s*\'([a-f0-9]{64})\'\s*,\s*type:\s*\'query\'\s*,\s*name:\s*\'Proposal\'',
+        # id:"...",type:"query",name:"Proposal"   (and permutations)
+        r'id\s*:\s*' + Q + H + Q + r'\s*,\s*type\s*:\s*' + Q + op_type + Q +
+        r'\s*,\s*name\s*:\s*' + Q + op_name + Q,
+        r'name\s*:\s*' + Q + op_name + Q + r'\s*,\s*type\s*:\s*' + Q + op_type + Q +
+        r'\s*,\s*id\s*:\s*' + Q + H + Q,
+        r'type\s*:\s*' + Q + op_type + Q + r'\s*,\s*name\s*:\s*' + Q + op_name + Q +
+        r'\s*,\s*id\s*:\s*' + Q + H + Q,
+        r'id\s*:\s*' + Q + H + Q + r'\s*,\s*name\s*:\s*' + Q + op_name + Q,
+        # manifest/lookup form:  Proposal:"<hex>"  |  "Proposal":"<hex>"
+        Q + '?' + op_name + Q + r'?\s*:\s*' + Q + H + Q,
+        # loose window fallbacks (last resort)
+        op_name + r'.{0,400}?' + H,
+        H + r'.{0,400}?' + op_name,
     ]
     for p in patterns:
-        match = re.search(p, js_body)
-        if match:
-            return match.group(1)
-    return ""
-
-def extract_submit_for_completion_id(js_body: str) -> str:
-    patterns = [
-        r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"mutation"\s*,\s*name:\s*"SubmitForCompletion"',
-        r'name:\s*"SubmitForCompletion"\s*,\s*type:\s*"mutation"\s*,\s*id:\s*"([a-f0-9]{64})"',
-        r'"SubmitForCompletion"[^}]{0,200}id:\s*"([a-f0-9]{64})"',
-        r'id:\s*"([a-f0-9]{64})"[^}]{0,200}"SubmitForCompletion"',
-        r'id:\s*\'([a-f0-9]{64})\'\s*,\s*type:\s*\'mutation\'\s*,\s*name:\s*\'SubmitForCompletion\'',
-    ]
-    for p in patterns:
-        match = re.search(p, js_body)
-        if match:
-            return match.group(1)
-    return ""
-
-def extract_poll_for_receipt_id(js_body: str) -> str:
-    patterns = [
-        r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"query"\s*,\s*name:\s*"PollForReceipt"',
-        r'name:\s*"PollForReceipt"\s*,\s*type:\s*"query"\s*,\s*id:\s*"([a-f0-9]{64})"',
-        r'"PollForReceipt"[^}]{0,200}id:\s*"([a-f0-9]{64})"',
-        r'id:\s*"([a-f0-9]{64})"[^}]{0,200}"PollForReceipt"',
-        r'id:\s*\'([a-f0-9]{64})\'\s*,\s*type:\s*\'query\'\s*,\s*name:\s*\'PollForReceipt\'',
-        r'PollForReceipt.{0,300}?([a-f0-9]{64})',
-        r'([a-f0-9]{64}).{0,300}?PollForReceipt',
-        r'id:([a-f0-9]{64}),type:"query",name:"PollForReceipt"',
-        r'id:"([a-f0-9]{64})",.*?name:"PollForReceipt"',
-    ]
-    for p in patterns:
-        match = re.search(p, js_body)
-        if match:
-            return match.group(1)
+        for match in re.finditer(p, js_body):
+            val = match.group(1)
+            if val not in taken:
+                taken.add(val)
+                return val
     return ""
 
 def extract_receipt_id(submit_body: str) -> str:
@@ -561,40 +544,41 @@ if not actions_url:
                 actions_url = script
             break
 
-js_body = ""
-if actions_url:
+candidate_urls = []
+for u in [actions_url, events_js_url, processing_url]:
+    if u and u not in candidate_urls:
+        candidate_urls.append(u)
+
+page_scripts = re.findall(r'(?:src|href)\s*=\s*["\']([^"\']+\.js)["\']', html_text)
+for s in page_scripts:
+    if s.startswith('http'):
+        full = s
+    elif s.startswith('/'):
+        full = domain + s
+    else:
+        full = domain + '/' + s
+    if full not in candidate_urls:
+        candidate_urls.append(full)
+
+op_types = {"Proposal": "query", "SubmitForCompletion": "mutation", "PollForReceipt": "query"}
+op_ids = {"Proposal": "", "SubmitForCompletion": "", "PollForReceipt": ""}
+taken_hexes = set()
+
+for js_url in candidate_urls:
+    missing = [op for op, v in op_ids.items() if not v]
+    if not missing:
+        break
     try:
-        js_body = fetch_js(session, actions_url, domain, checkout_url_final)
-    except Exception as e:
-        print(f"Failed to fetch actions JS: {e}")
+        js = fetch_js(session, js_url, domain, checkout_url_final)
+    except Exception:
+        continue
+    for op in missing:
+        if not op_ids[op]:
+            op_ids[op] = extract_operation_id(js, op, op_types[op], taken_hexes)
 
-proposal_id = extract_proposal_id(js_body) if js_body else ""
-submit_id = extract_submit_for_completion_id(js_body) if js_body else ""
-
-poll_id = ""
-for source_js in [events_js_url, processing_url]:
-    if source_js and not poll_id:
-        try:
-            js = fetch_js(session, source_js, domain, checkout_url_final)
-            poll_id = extract_poll_for_receipt_id(js)
-        except Exception as e:
-            print(f"Failed to fetch JS for poll ID: {e}")
-
-if not poll_id and js_body:
-    poll_id = extract_poll_for_receipt_id(js_body)
-
-if not poll_id:
-    all_js_urls = re.findall(r'<script[^>]+src="([^"]+\.js)"', html_text)
-    for js_url in all_js_urls:
-        if not js_url.startswith('http'):
-            js_url = domain + js_url
-        try:
-            js = fetch_js(session, js_url, domain, checkout_url_final)
-            poll_id = extract_poll_for_receipt_id(js)
-            if poll_id:
-                break
-        except Exception as e:
-            continue
+proposal_id = op_ids["Proposal"]
+submit_id = op_ids["SubmitForCompletion"]
+poll_id = op_ids["PollForReceipt"]
 
 if not poll_id:
     poll_id = FALLBACK_POLL_ID
@@ -715,7 +699,7 @@ addr = {
     "phone": "+12125551212",
 }
 
-proposal2_variables = base_proposal.copy()
+proposal2_variables = deepcopy(base_proposal)
 proposal2_variables["queueToken"] = queue_token
 proposal2_variables["buyerIdentity"]["email"] = email
 proposal2_variables["buyerIdentity"]["emailChanged"] = True
@@ -740,7 +724,7 @@ if proposal2_resp.status_code != 200:
 queue_token2 = extract_queue_token(json.dumps(proposal2_data))
 print(f"QueueToken2: {queue_token2}")
 
-proposal3_variables = proposal2_variables.copy()
+proposal3_variables = deepcopy(proposal2_variables)
 proposal3_variables["queueToken"] = queue_token2
 proposal3_variables["delivery"]["deliveryLines"][0]["destination"]["partialStreetAddress"] = {
     "address1": addr["address1"], "city": addr["city"], "countryCode": addr["country_code"],
